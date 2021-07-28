@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST, CIFAR10
-from torchvision.transforms import Compose, PILToTensor, Normalize, ConvertImageDtype
+from torchvision.transforms import Compose, ToTensor, Normalize, ConvertImageDtype
 
 import numpy as np
 
@@ -32,7 +32,6 @@ class Net(nn.Module):
         return x
 
 
-ray.init()
 
 class MyTrainingOperator(TrainingOperator):
     def setup(self, config):
@@ -41,12 +40,12 @@ class MyTrainingOperator(TrainingOperator):
             ds_train = MNIST(root=config['download_loc'], 
                              train=True, 
                              download=True,
-                             transform=Compose([PILToTensor(), ConvertImageDtype(dtype=torch.float32), Normalize((128.,), (255.,))]))
+                             transform=Compose([ToTensor(), Normalize((128./255,), (1,))]))
 
             ds_val = MNIST(root=config['download_loc'], 
                            train=False, 
                            download=True,
-                           transform=Compose([PILToTensor(), ConvertImageDtype(dtype=torch.float32), Normalize((128.,), (255.,))]))
+                           transform=Compose([ToTensor(), Normalize((128./255,), (1,))]))
         
         elif config['dataset'] == 'CIFAR10':
         
@@ -74,6 +73,8 @@ class MyTrainingOperator(TrainingOperator):
                           criterion=criterion,
                           schedulers=None)
         self.register_data(train_loader=dl_train, validation_loader=dl_val)
+
+ray.init()
 
 #uses DDP
 num_workers = 6
