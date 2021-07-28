@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+import pickle
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pylab as plt
 import numpy as np
 from torchvision.transforms import Compose, PILToTensor
-from torchvision.datasets import MNIST
+from torchvision.datasets import MNIST, CIFAR10
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -21,10 +22,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 #to run DDP on one local node:
-
-#python launch.py --nnode 1 --nproc_per_node cpu pytorch_dist_test2.py --local_world_size 12
 #python run.py --nnode 1 --nproc_per_node cpu pytorch_dist_test2.py --local_world_size 12
-
+#device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+device = "cpu"
 
 key_list = ['MASTER_ADDR', 'MASTER_PORT', 'RANK', 'WORLD_SIZE']
 
@@ -40,7 +40,6 @@ def create_net(lr=1e-2):
 
             linear_input = ((28 - 2*len(self.layer_list))**2)*self.layer_list[-1].out_channels
             self.output = nn.Linear(linear_input, 10)
-            #self.output_activation = nn.Softmax(dim=1)
 
         def forward(self, x):
             for layer in self.layer_list:
@@ -52,9 +51,8 @@ def create_net(lr=1e-2):
 
     net = Net()
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=lr)
 
-    return net, criterion, optimizer 
+    return net, criterion
 
 def create_dsdl(download_loc='./', dataset='MNIST'):
     if dataset == 'MNIST':
@@ -89,7 +87,8 @@ def ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=50, batch_size=32
 
     print(env_dict)
 
-    dist.init_process_group(backend='gloo')
+    backend = "gloo" if device=='cpu' else 'nccl'
+    dist.init_process_group(backend=backend)
 
     print(
         f"[{os.getpid()}] rank = {dist.get_rank()}, "
@@ -97,7 +96,7 @@ def ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=50, batch_size=32
     )
 
     #temp logging
-    f = open(f'log_{rank}', 'w')
+    f = open(f'log_world{world_size}_{rank}', 'w')
 
     #distributed sampling from dataset
     ds_train, ds_test = create_dsdl(dataset=dataset)
@@ -105,14 +104,22 @@ def ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=50, batch_size=32
     dl_train = DataLoader(dataset=ds_train, sampler=sampler_train, batch_size=batch_size)
 
     sampler_test = DistributedSampler(ds_test)
-    dl_test = DataLoader(dataset=ds_test, sampler=sampler_test, batch_size=batch_size)
+    #dl_test = DataLoader(dataset=ds_test, sampler=sampler_test, batch_size=batch_size)
+    dl_test = DataLoader(dataset=ds_test, batch_size=batch_size)
 
     #model init
-    net, criterion, optimizer = create_net(lr=lr)    
-    net = DDP(net, device_ids=None, output_device=None) #None for CPU-based
+    net, criterion = create_net(lr=lr)
+    net = net.to(device)
+    if device=="cpu":
+        net = DDP(net, device_ids=None, output_device=None) #None for CPU-based
+    else:
+        net = DDP(net, device_ids=[device], output_device=device) #None for CPU-based
 
+    optimizer = optim.Adam(net.parameters(), lr=lr) #net refers to the ddp model here
+
+    #net = DDP(net, device_ids=rank, output_device=rank)
+    #torch.device(rank) #torch.device("cuda") #torch.device(0)
     net = net.train() #in place?
-    #optimizer = optim.Adam(net.parameters(), lr=lr)
     #net = net.to(rank)
 
     time_dict = {}
@@ -127,8 +134,8 @@ def ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=50, batch_size=32
         for idx, (X, y) in enumerate(dl_train):
             X = (X - 128.) / 255.
 
-            #X = X.to(rank)
-            #y = y.to(rank)
+            X = X.to(device)
+            y = y.to(device)
 
             pred = net(X)
             loss = criterion(pred, y)
@@ -147,15 +154,23 @@ def ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=50, batch_size=32
             print(list(net.parameters()), file=f)
 
         if n % print_freq == 0:
-            val_acc = evaluate_model(net, dl_test)
-            print(f'rank={rank} epoch = {n} loss = {total_loss:.3f} train accuracy = {total_correct/total_n} val accuracy={val_acc:.2f}', file=f)
+            
+            for idx, p in enumerate(list(net.parameters())):
+                print(f'CHECK ME: rank={rank} epoch={n} param_n={idx} {p.sum()}', file=f)
+            
+            dist.barrier()
+            val_acc = evaluate_model(net, dl_test, device=device)
+            dist.barrier()
+            
+            print(f'rank={rank} epoch = {n} total_examples={total_n} loss = {total_loss:.3f} train accuracy = {total_correct/total_n} val accuracy={val_acc:.2f}', file=f)
 
             time_dict[n] = (time.time()-start, val_acc)            
             print(time_dict, file=f)
 
+    pickle.dump(time_dict, open(f'perf_world{world_size}_rank{rank}', 'wb'))
+
     f.close()
     dist.destroy_process_group()
-
 
     return net
 
@@ -168,8 +183,8 @@ def evaluate_model(net, dl_test, device='cpu'):
 
     for idx, (X, y) in enumerate(dl_test):
         X = (X - 128.) / 255.
-        #X = X.to(device)
-        #y = y.to(device)
+        X = X.to(device)
+        y = y.to(device)
 
         pred = net(X)
 
@@ -204,6 +219,24 @@ def example(rank, world_size):
 
     dist.destroy_process_group()
 
+def plot(loc='mnist_logs', max_world_size=12):
+    def get_data(d):
+        xvals, yvals = [], []
+        for k in range(10):
+            xvals.append(d[k][0])
+            yvals.append(d[k][1])
+        
+        return xvals, yvals
+
+    plt.figure()
+    for w in range(1, max_world_size+1):
+        d = pickle.load(open(loc + '/' + fname.format(w), 'rb'))
+        xvals, yvals = get_data(d)
+        plt.plot(xvals, yvals, label=f'{w} workers')
+        plt.legend()
+
+
+
 #def main(world_size):
 #    mp.spawn(example, args=(world_size,), nprocs=world_size, join=True)
 
@@ -222,4 +255,4 @@ if __name__=='__main__':
     world_size = int(os.environ['WORLD_SIZE'])
 
     #example(rank, world_size)
-    ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=5, batch_size=120, lr=1e-2, print_freq=2)
+    ddp_train_loop(rank, world_size, dataset='MNIST', n_epochs=5, batch_size=120, lr=1e-2, print_freq=1)
