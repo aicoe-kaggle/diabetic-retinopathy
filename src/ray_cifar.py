@@ -12,15 +12,15 @@ from torchvision.transforms import Compose, ToTensor, Normalize, ConvertImageDty
 import numpy as np
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=1, in_size=28):
         super(Net, self).__init__()
         self.layer_list = nn.ModuleList()
-        self.layer_list.append(nn.Conv2d(1, 16, 3, 1))
+        self.layer_list.append(nn.Conv2d(in_channels, 16, 3, 1))
         self.layer_list.append(nn.Conv2d(16, 32, 3, 1))
         self.layer_list.append(nn.Conv2d(32, 64, 3, 1))
         self.activation = nn.ReLU()
 
-        linear_input = ((28 - 2*len(self.layer_list))**2)*self.layer_list[-1].out_channels
+        linear_input = ((in_size - 2*len(self.layer_list))**2)*self.layer_list[-1].out_channels
         self.output = nn.Linear(linear_input, 10)
 
     def forward(self, x):
@@ -30,8 +30,6 @@ class Net(nn.Module):
         x = self.output(x.reshape(-1, self.output.in_features)) #logits
         
         return x
-
-
 
 class MyTrainingOperator(TrainingOperator):
     def setup(self, config):
@@ -47,23 +45,25 @@ class MyTrainingOperator(TrainingOperator):
                            download=True,
                            transform=Compose([ToTensor(), Normalize((128./255,), (1,))]))
         
+            net = Net(in_channels=1, in_size=28)
+
         elif config['dataset'] == 'CIFAR10':
         
             ds_train = CIFAR10(root=config['download_loc'], 
                                train=True, 
                                download=True,
-                               transform=PILToTensor())
+                               transform=Compose([ToTensor(), Normalize((128./255,), (1,))]))
 
             ds_val = CIFAR10(root=config['download_loc'], 
                              train=False, 
                              download=True,
-                             transform=PILToTensor())
+                             transform=Compose([ToTensor(), Normalize((128./255,), (1,))]))
 
+            net = Net(in_channels=3, in_size=32)
 
         dl_train = DataLoader(ds_train, batch_size=config['batch_size'])
         dl_val = DataLoader(ds_val, batch_size=config['batch_size'])
 
-        net = Net()
         optimizer = optim.Adam(net.parameters(), lr=1e-2)
         criterion = nn.CrossEntropyLoss()
 
@@ -84,7 +84,7 @@ trainer = TorchTrainer(
     training_operator_cls = MyTrainingOperator,
     num_workers = num_workers,
     use_gpu = False,
-    config = {'dataset': 'MNIST', 'download_loc': './', 'batch_size': num_workers*batch_size_per_worker})
+    config = {'dataset': 'CIFAR10', 'download_loc': './', 'batch_size': num_workers*batch_size_per_worker})
 
 for n in range(10):
     print(f'----------Epoch {n}---------------')
